@@ -65,3 +65,7 @@ eval "$(modafinil completions zsh)"
 ## Requirements
 
 macOS. Uses `caffeinate`, `pmset`, and `launchctl`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
