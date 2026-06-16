@@ -2,6 +2,12 @@
 
 [![CI](https://github.com/NishantJoshi00/modafinil/actions/workflows/ci.yml/badge.svg)](https://github.com/NishantJoshi00/modafinil/actions/workflows/ci.yml)
 
+<p align="center">
+  <img src="assets/hero.png" alt="A hand carrying a MacBook with the lid barely open to keep it awake" width="640">
+  <br>
+  <em>Tired of carrying your laptop like this to keep an agent running? Close the lid.</em>
+</p>
+
 Keep a Mac fully awake — display on, even with the lid closed — until a command
 finishes or you stop it. Then put your normal sleep settings back.
 
