@@ -20,6 +20,7 @@
 # Options:
 #   -d   accepted for compatibility; display sleep is always blocked
 #   -h   show help
+#   -v   show version
 #
 # Setup:
 #   modafinil --install                one-time setup (asks for your password)
@@ -35,6 +36,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 readonly PROG="${0##*/}"
+readonly VERSION="0.1.0"
 readonly PMSET="/usr/bin/pmset"
 readonly SUDOERS_FILE="/etc/sudoers.d/modafinil"
 readonly LAUNCHD_LABEL="com.nishantjoshi.modafinil-reset"
@@ -53,6 +55,10 @@ declare -a command_args=()
 
 usage() {
   awk 'NR < 3 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${0}"
+}
+
+version() {
+  printf '%s %s\n' "${PROG}" "${VERSION}"
 }
 
 die() {
@@ -452,6 +458,10 @@ main() {
   case "${1:-}" in
     completions|completion)
       print_completions "${2:-}"
+      exit 0
+      ;;
+    -v|--version)
+      version
       exit 0
       ;;
     *)

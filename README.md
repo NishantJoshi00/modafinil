@@ -1,5 +1,7 @@
 # modafinil
 
+[![CI](https://github.com/NishantJoshi00/modafinil/actions/workflows/ci.yml/badge.svg)](https://github.com/NishantJoshi00/modafinil/actions/workflows/ci.yml)
+
 Keep a Mac fully awake — display on, even with the lid closed — until a command
 finishes or you stop it. Then put your normal sleep settings back.
 
@@ -14,7 +16,30 @@ prevent that, modafinil installs a one-time boot job that resets the setting on
 your next startup. It refuses to touch power settings until that safety net is
 in place.
 
-## Install
+## How it compares
+
+Homebrew already has GUI menubar apps for this — KeepingYouAwake (`brew install
+--cask keepingyouawake`) and Amphetamine. modafinil is the opposite: CLI-native
+and scriptable (`modafinil -- make release`), it handles lid-close sleep, and it
+restores your settings cleanly on exit or crash. The short version: `caffeinate`
+won't keep a Mac awake with the lid closed; this does, safely.
+
+## Installation
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/NishantJoshi00/modafinil/v0.1.0/modafinil \
+  -o /usr/local/bin/modafinil
+chmod +x /usr/local/bin/modafinil
+```
+
+Or clone and symlink it onto your `PATH`:
+
+```sh
+git clone https://github.com/NishantJoshi00/modafinil.git
+ln -s "$PWD/modafinil/modafinil" /usr/local/bin/modafinil
+```
+
+## First-time setup
 
 ```sh
 modafinil --install     # one-time; asks for your password
