@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+#
+# modafinil - keep a Mac awake, including the display and lid-closed mode.
+#
+# Why this exists:
+#   caffeinate blocks idle system/display sleep while this script is running,
+#   but lid-close sleep is controlled by the persistent macOS power setting
+#   `pmset disablesleep`. Persistent settings are risky if a script crashes,
+#   so modafinil requires a boot-time recovery LaunchDaemon before it will
+#   change that setting.
+#
+# Safety model:
+#   - While active: block idle system sleep, display sleep, and lid-close sleep.
+#   - Normal exit: release caffeinate and restore the previous disablesleep value.
+#   - Ctrl-C/TERM: restore once, then exit with the signal.
+#   - Crash, kill -9, power loss, dead battery: next boot runs
+#     `/usr/bin/pmset -a disablesleep 0`.
+#   - No recovery plist: refuse to change macOS power settings.
+#
+# Usage:
+#   modafinil -- <command> [args...]   run command, stay awake until it exits
+#   modafinil -w <pid>                 stay awake until pid exits
+#   modafinil -n <name>                stay awake while any process matches name
+#   modafinil                          stay awake until Ctrl-C
+#
+# Options:
+#   -d   accepted for compatibility; display sleep is always blocked
+#   -h   show help
+#
+# Setup:
+#   modafinil --install                install reboot recovery + sudoers rule
+#   modafinil --uninstall              remove modafinil's installed files
+#
+# Recovery:
+#   modafinil --off                    immediately restore normal sleep
+#
+# Completions:
+#   eval "$(modafinil completions zsh)"
+
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly PROG="${0##*/}"
+readonly PMSET="/usr/bin/pmset"
+readonly SUDOERS_FILE="/etc/sudoers.d/modafinil"
+readonly LAUNCHD_LABEL="com.nishantjoshi.modafinil-reset"
+readonly LAUNCHD_FILE="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
+readonly CAFFEINATE_MARKER="modafinil-caffeinate-helper"
+readonly CAFFEINATE_PATTERN="${CAFFEINATE_MARKER}"
+
+declare -i wake_enabled=0
+declare -i cleanup_done=0
+
+mode="hold"
+target=""
+caffeinate_pid=""
+restore_disablesleep=0
+declare -a command_args=()
+
+usage() {
+  awk 'NR < 3 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${0}"
+}
+
+die() {
+  printf '%s: %s\n' "${PROG}" "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '%s: %s\n' "${PROG}" "$*"
+}
+
+warn() {
+  printf '%s: WARNING: %s\n' "${PROG}" "$*" >&2
+}
+
+print_zsh_completions() {
+  cat <<'EOF'
+#compdef modafinil
+
+_modafinil() {
+  local curcontext="${curcontext}" state line
+  local -a processes
+  typeset -A opt_args
+
+  _arguments -C \
+    '(-h --help)'{-h,--help}'[show help]' \
+    '--install[install reboot recovery and sudoers rule]' \
+    '--uninstall[remove modafinil installed files]' \
+    '--off[immediately restore normal sleep]' \
+    '--reset[alias for --off]' \
+    '--disable[alias for --off]' \
+    '-d[accepted for compatibility; display sleep is always blocked]' \
+    '-w[stay awake until pid exits]:pid:_pids' \
+    '-n[stay awake while any process matches name]:process name:->process_name' \
+    '1:command:(-- -w -n)' \
+    '*::argument:->argument' \
+    && return
+
+  case "${state}" in
+    process_name)
+      processes=(${(u)${(f)"$(ps -axo comm= 2>/dev/null)"}})
+      compadd -a processes
+      ;;
+    argument)
+      if [[ "${words[CURRENT - 1]}" == "--" ]]; then
+        _command_names
+      else
+        _normal
+      fi
+      ;;
+  esac
+}
+
+compdef _modafinil modafinil
+EOF
+}
+
+print_completions() {
+  local shell_name="${1:-}"
+
+  case "${shell_name}" in
+    zsh)
+      print_zsh_completions
+      ;;
+    ""|-h|--help)
+      printf 'Usage: %s completions zsh\n' "${PROG}"
+      ;;
+    *)
+      die "unsupported completion shell: ${shell_name}"
+      ;;
+  esac
+}
+
+require_macos() {
+  local os_name
+  os_name="$(uname)"
+  [[ "${os_name}" == "Darwin" ]] || die "macOS only"
+}
+
+require_value() {
+  local flag="$1"
+  local value="${2:-}"
+  [[ -n "${value}" ]] || die "${flag} needs a value"
+}
+
+# --- installed safety net ----------------------------------------------------
+
+write_recovery_plist() {
+  local path="$1"
+
+  cat > "${path}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${PMSET}</string>
+    <string>-a</string>
+    <string>disablesleep</string>
+    <string>0</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>LaunchOnlyOnce</key>
+  <true/>
+</dict>
+</plist>
+EOF
+}
+
+install_recovery() {
+  local tmp
+  tmp="$(mktemp)"
+  write_recovery_plist "${tmp}"
+
+  if ! plutil -lint "${tmp}" >/dev/null 2>&1; then
+    rm -f "${tmp}"
+    die "generated launchd plist failed validation"
+  fi
+
+  info "installing ${LAUNCHD_FILE}"
+  sudo install -m 644 -o root -g wheel "${tmp}" "${LAUNCHD_FILE}"
+  rm -f "${tmp}"
+
+  # Loading runs the one-shot reset now; the plist runs again on future boots.
+  sudo launchctl bootout system "${LAUNCHD_FILE}" >/dev/null 2>&1 || true
+  sudo launchctl bootstrap system "${LAUNCHD_FILE}"
+}
+
+uninstall_recovery() {
+  if [[ ! -f "${LAUNCHD_FILE}" ]]; then
+    info "no recovery plist to remove"
+    return 0
+  fi
+
+  sudo launchctl bootout system "${LAUNCHD_FILE}" >/dev/null 2>&1 || true
+  sudo rm -f "${LAUNCHD_FILE}"
+  info "removed ${LAUNCHD_FILE}"
+}
+
+ensure_recovery_installed() {
+  [[ -f "${LAUNCHD_FILE}" ]] || die "reboot recovery is not installed; run '${PROG} --install' first"
+  plutil -lint "${LAUNCHD_FILE}" >/dev/null 2>&1 || die "reboot recovery plist is invalid; run '${PROG} --install'"
+}
+
+# --- passwordless pmset ------------------------------------------------------
+
+write_sudoers_rule() {
+  local path="$1"
+  local user="$2"
+
+  cat > "${path}" <<EOF
+# Installed by modafinil. Allows only these two root commands without a password.
+${user} ALL=(root) NOPASSWD: ${PMSET} -a disablesleep 0, ${PMSET} -a disablesleep 1
+EOF
+}
+
+install_sudoers() {
+  local user tmp
+  user="$(id -un)"
+  [[ "${user}" =~ ^[A-Za-z0-9._-]+$ ]] || die "unsupported username for sudoers rule: ${user}"
+
+  tmp="$(mktemp)"
+  write_sudoers_rule "${tmp}" "${user}"
+
+  if ! visudo -cf "${tmp}" >/dev/null 2>&1; then
+    rm -f "${tmp}"
+    die "generated sudoers rule failed validation"
+  fi
+
+  info "installing ${SUDOERS_FILE}"
+  sudo install -m 440 -o root -g wheel "${tmp}" "${SUDOERS_FILE}"
+  rm -f "${tmp}"
+
+  if ! sudo visudo -c >/dev/null 2>&1; then
+    sudo rm -f "${SUDOERS_FILE}"
+    die "sudoers integrity check failed; rolled back"
+  fi
+}
+
+uninstall_sudoers() {
+  if [[ ! -f "${SUDOERS_FILE}" ]]; then
+    info "no sudoers rule to remove"
+    return 0
+  fi
+
+  sudo rm -f "${SUDOERS_FILE}"
+  info "removed ${SUDOERS_FILE}"
+}
+
+install_all() {
+  install_recovery
+  install_sudoers
+  info "installed; reboot recovery is one-shot and does not stay running"
+}
+
+uninstall_all() {
+  uninstall_recovery
+  uninstall_sudoers
+}
+
+# --- power state -------------------------------------------------------------
+
+get_disablesleep() {
+  "${PMSET}" -g custom | awk '
+    $1 == "disablesleep" { value = $2 }
+    END {
+      if (value == "") value = 0
+      print value
+    }
+  '
+}
+
+set_disablesleep() {
+  local value="$1"
+  [[ "${value}" == "0" || "${value}" == "1" ]] || die "invalid disablesleep value: ${value}"
+
+  sudo -n "${PMSET}" -a disablesleep "${value}" 2>/dev/null && return 0
+  warn "passwordless rule missing; run '${PROG} --install' to skip prompts"
+  sudo "${PMSET}" -a disablesleep "${value}"
+}
+
+kill_modafinil_caffeinate() {
+  local pid
+  while IFS= read -r pid; do
+    [[ "${pid}" == "$$" ]] && continue
+    kill "${pid}" 2>/dev/null || true
+  done < <(pgrep -f "${CAFFEINATE_PATTERN}" 2>/dev/null || true)
+}
+
+kill_caffeinate_tree() {
+  local parent="$1"
+  local child
+  [[ -n "${parent}" ]] || return 0
+
+  while IFS= read -r child; do
+    kill "${child}" 2>/dev/null || true
+  done < <(pgrep -P "${parent}" 2>/dev/null || true)
+
+  kill "${parent}" 2>/dev/null || true
+}
+
+turn_off() {
+  kill_modafinil_caffeinate
+  set_disablesleep 0
+  info "off; normal sleep restored"
+}
+
+# --- argument parsing --------------------------------------------------------
+
+parse_args() {
+  case "${1:-}" in
+    --install) install_all; exit 0 ;;
+    --uninstall) uninstall_all; exit 0 ;;
+    --off|--reset|--disable) turn_off; exit 0 ;;
+    --install-sudoers|--uninstall-sudoers)
+      die "use --install or --uninstall"
+      ;;
+    *)
+      ;;
+  esac
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d)
+        # Kept for old muscle memory. Display sleep is now always blocked.
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -w)
+        require_value "-w" "${2:-}"
+        mode="pid"
+        target="$2"
+        shift 2
+        ;;
+      -n)
+        require_value "-n" "${2:-}"
+        mode="name"
+        target="$2"
+        shift 2
+        ;;
+      --)
+        mode="cmd"
+        shift
+        command_args=("$@")
+        break
+        ;;
+      -*)
+        usage >&2
+        die "unknown option $1"
+        ;;
+      *)
+        die "unexpected argument '$1'; use '-- <command>' to run a command"
+        ;;
+    esac
+  done
+
+  validate_target
+}
+
+validate_target() {
+  case "${mode}" in
+    hold)
+      :
+      ;;
+    cmd)
+      [[ ${#command_args[@]} -gt 0 ]] || die "-- needs a command"
+      ;;
+    pid)
+      [[ "${target}" =~ ^[0-9]+$ ]] || die "-w needs a numeric pid"
+      kill -0 "${target}" 2>/dev/null || die "no such pid ${target}"
+      ;;
+    name)
+      [[ -n "${target}" ]] || die "-n needs a process name"
+      pgrep -f "${target}" >/dev/null || die "no process matches '${target}'"
+      ;;
+    *)
+      die "internal error: invalid mode '${mode}'"
+      ;;
+  esac
+}
+
+enable_wake() {
+  ensure_recovery_installed
+  restore_disablesleep="$(get_disablesleep)"
+  [[ "${restore_disablesleep}" == "0" || "${restore_disablesleep}" == "1" ]] \
+    || die "unexpected current disablesleep value: ${restore_disablesleep}"
+
+  set_disablesleep 1
+  wake_enabled=1
+
+  caffeinate -d -i /bin/bash -c 'while :; do sleep 86400; done' "${CAFFEINATE_MARKER}" &
+  caffeinate_pid=$!
+
+  info "awake; idle sleep, display sleep, and lid-close sleep disabled"
+}
+
+restore() {
+  local restore_status
+
+  [[ ${wake_enabled} -eq 1 ]] || return 0
+  [[ ${cleanup_done} -eq 0 ]] || return 0
+  cleanup_done=1
+
+  kill_caffeinate_tree "${caffeinate_pid}"
+
+  set +e
+  set_disablesleep "${restore_disablesleep}"
+  restore_status=$?
+  set -e
+
+  if [[ ${restore_status} -ne 0 ]]; then
+    warn "failed to restore disablesleep=${restore_disablesleep}; reboot resets it to 0"
+    return 0
+  fi
+
+  info "restored disablesleep=${restore_disablesleep}"
+}
+
+on_signal() {
+  local sig="$1"
+  restore
+  trap - "${sig}"
+  kill -s "${sig}" "$$"
+}
+
+# --- run modes ---------------------------------------------------------------
+
+run_mode() {
+  case "${mode}" in
+    hold)
+      info "holding until Ctrl-C"
+      while true; do sleep 86400; done
+      ;;
+    cmd)
+      "${command_args[@]}" &
+      local child=$!
+      wait "${child}"
+      ;;
+    pid)
+      info "watching pid ${target}"
+      while kill -0 "${target}" 2>/dev/null; do sleep 2; done
+      ;;
+    name)
+      info "watching processes matching '${target}'"
+      while pgrep -f "${target}" >/dev/null; do sleep 2; done
+      ;;
+    *)
+      die "internal error: invalid mode '${mode}'"
+      ;;
+  esac
+}
+
+main() {
+  case "${1:-}" in
+    completions|completion)
+      print_completions "${2:-}"
+      exit 0
+      ;;
+    *)
+      ;;
+  esac
+
+  require_macos
+  parse_args "$@"
+
+  trap restore EXIT
+  trap 'on_signal INT' INT
+  trap 'on_signal TERM' TERM
+
+  enable_wake
+  run_mode
+}
+
+main "$@"
