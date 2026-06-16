@@ -2,20 +2,14 @@
 #
 # modafinil - keep a Mac awake, including the display and lid-closed mode.
 #
-# Why this exists:
-#   caffeinate blocks idle system/display sleep while this script is running,
-#   but lid-close sleep is controlled by the persistent macOS power setting
-#   `pmset disablesleep`. Persistent settings are risky if a script crashes,
-#   so modafinil requires a boot-time recovery LaunchDaemon before it will
-#   change that setting.
+# What it does:
+#   modafinil keeps your Mac fully awake, including the display and with the
+#   lid closed, until your command finishes or you stop it.
 #
-# Safety model:
-#   - While active: block idle system sleep, display sleep, and lid-close sleep.
-#   - Normal exit: release caffeinate and restore the previous disablesleep value.
-#   - Ctrl-C/TERM: restore once, then exit with the signal.
-#   - Crash, kill -9, power loss, dead battery: next boot runs
-#     `/usr/bin/pmset -a disablesleep 0`.
-#   - No recovery plist: refuse to change macOS power settings.
+# Your sleep settings are safe:
+#   modafinil puts your normal sleep settings back when it exits. If it is ever
+#   interrupted, your Mac returns to normal sleep on its own the next time it
+#   starts up, so it can never get stuck awake.
 #
 # Usage:
 #   modafinil -- <command> [args...]   run command, stay awake until it exits
@@ -28,8 +22,8 @@
 #   -h   show help
 #
 # Setup:
-#   modafinil --install                install reboot recovery + sudoers rule
-#   modafinil --uninstall              remove modafinil's installed files
+#   modafinil --install                one-time setup (asks for your password)
+#   modafinil --uninstall              undo setup and remove modafinil's files
 #
 # Recovery:
 #   modafinil --off                    immediately restore normal sleep
@@ -85,8 +79,8 @@ _modafinil() {
 
   _arguments -C \
     '(-h --help)'{-h,--help}'[show help]' \
-    '--install[install reboot recovery and sudoers rule]' \
-    '--uninstall[remove modafinil installed files]' \
+    '--install[one-time setup]' \
+    '--uninstall[undo setup]' \
     '--off[immediately restore normal sleep]' \
     '--reset[alias for --off]' \
     '--disable[alias for --off]' \
@@ -182,10 +176,9 @@ install_recovery() {
 
   if ! plutil -lint "${tmp}" >/dev/null 2>&1; then
     rm -f "${tmp}"
-    die "generated launchd plist failed validation"
+    die "setup couldn't be prepared; please try again"
   fi
 
-  info "installing ${LAUNCHD_FILE}"
   sudo install -m 644 -o root -g wheel "${tmp}" "${LAUNCHD_FILE}"
   rm -f "${tmp}"
 
@@ -195,19 +188,15 @@ install_recovery() {
 }
 
 uninstall_recovery() {
-  if [[ ! -f "${LAUNCHD_FILE}" ]]; then
-    info "no recovery plist to remove"
-    return 0
-  fi
+  [[ -f "${LAUNCHD_FILE}" ]] || return 0
 
   sudo launchctl bootout system "${LAUNCHD_FILE}" >/dev/null 2>&1 || true
   sudo rm -f "${LAUNCHD_FILE}"
-  info "removed ${LAUNCHD_FILE}"
 }
 
 ensure_recovery_installed() {
-  [[ -f "${LAUNCHD_FILE}" ]] || die "reboot recovery is not installed; run '${PROG} --install' first"
-  plutil -lint "${LAUNCHD_FILE}" >/dev/null 2>&1 || die "reboot recovery plist is invalid; run '${PROG} --install'"
+  [[ -f "${LAUNCHD_FILE}" ]] || die "${PROG} isn't set up yet; run '${PROG} --install' first"
+  plutil -lint "${LAUNCHD_FILE}" >/dev/null 2>&1 || die "${PROG}'s setup looks damaged; run '${PROG} --install' to repair it"
 }
 
 # --- passwordless pmset ------------------------------------------------------
@@ -232,38 +221,35 @@ install_sudoers() {
 
   if ! visudo -cf "${tmp}" >/dev/null 2>&1; then
     rm -f "${tmp}"
-    die "generated sudoers rule failed validation"
+    die "setup couldn't be prepared; please try again"
   fi
 
-  info "installing ${SUDOERS_FILE}"
   sudo install -m 440 -o root -g wheel "${tmp}" "${SUDOERS_FILE}"
   rm -f "${tmp}"
 
   if ! sudo visudo -c >/dev/null 2>&1; then
     sudo rm -f "${SUDOERS_FILE}"
-    die "sudoers integrity check failed; rolled back"
+    die "setup didn't pass a safety check and was undone; nothing was changed"
   fi
 }
 
 uninstall_sudoers() {
-  if [[ ! -f "${SUDOERS_FILE}" ]]; then
-    info "no sudoers rule to remove"
-    return 0
-  fi
+  [[ -f "${SUDOERS_FILE}" ]] || return 0
 
   sudo rm -f "${SUDOERS_FILE}"
-  info "removed ${SUDOERS_FILE}"
 }
 
 install_all() {
+  info "setting up modafinil (you may be asked for your password)..."
   install_recovery
   install_sudoers
-  info "installed; reboot recovery is one-shot and does not stay running"
+  info "all set; modafinil is ready to use"
 }
 
 uninstall_all() {
   uninstall_recovery
   uninstall_sudoers
+  info "uninstalled; your normal sleep settings are back"
 }
 
 # --- power state -------------------------------------------------------------
@@ -283,7 +269,7 @@ set_disablesleep() {
   [[ "${value}" == "0" || "${value}" == "1" ]] || die "invalid disablesleep value: ${value}"
 
   sudo -n "${PMSET}" -a disablesleep "${value}" 2>/dev/null && return 0
-  warn "passwordless rule missing; run '${PROG} --install' to skip prompts"
+  warn "tip: run '${PROG} --install' once to skip the password prompt"
   sudo "${PMSET}" -a disablesleep "${value}"
 }
 
@@ -399,10 +385,11 @@ enable_wake() {
   set_disablesleep 1
   wake_enabled=1
 
-  caffeinate -d -i /bin/bash -c 'while :; do sleep 86400; done' "${CAFFEINATE_MARKER}" &
+  caffeinate -d -i /bin/bash -c 'while :; do sleep 86400; done' "${CAFFEINATE_MARKER}" \
+    >/dev/null 2>&1 &
   caffeinate_pid=$!
 
-  info "awake; idle sleep, display sleep, and lid-close sleep disabled"
+  info "awake; your Mac won't sleep, even with the lid closed"
 }
 
 restore() {
@@ -420,11 +407,11 @@ restore() {
   set -e
 
   if [[ ${restore_status} -ne 0 ]]; then
-    warn "failed to restore disablesleep=${restore_disablesleep}; reboot resets it to 0"
+    warn "couldn't restore your sleep settings now; they'll reset on your next restart"
     return 0
   fi
 
-  info "restored disablesleep=${restore_disablesleep}"
+  info "normal sleep settings restored"
 }
 
 on_signal() {
